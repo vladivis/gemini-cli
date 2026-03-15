@@ -5,18 +5,17 @@
  */
 
 import type React from 'react';
-import { useCallback, useEffect, useState, useRef, useMemo } from 'react';
 import clipboardy from 'clipboardy';
+import { useCallback, useEffect, useState, useRef, useMemo } from 'react';
 import { Box, Text, useStdout, type DOMElement } from 'ink';
 import { SuggestionsDisplay, MAX_WIDTH } from './SuggestionsDisplay.js';
 import { theme } from '../semantic-colors.js';
 import { useInputHistory } from '../hooks/useInputHistory.js';
-import { escapeAtSymbols } from '../hooks/atCommandProcessor.js';
 import { HalfLinePaddedBox } from './shared/HalfLinePaddedBox.js';
 import {
   type TextBuffer,
   logicalPosToOffset,
-  expandPastePlaceholders,
+  PASTED_TEXT_PLACEHOLDER_REGEX,
   getTransformUnderCursor,
   LARGE_PASTE_LINE_THRESHOLD,
   LARGE_PASTE_CHAR_THRESHOLD,
@@ -35,16 +34,12 @@ import {
   useCommandCompletion,
   CompletionMode,
 } from '../hooks/useCommandCompletion.js';
-import { useKeypress, type Key } from '../hooks/useKeypress.js';
-import { Command } from '../key/keyMatchers.js';
-import { formatCommand } from '../key/keybindingUtils.js';
+import type { Key } from '../hooks/useKeypress.js';
+import { useKeypress } from '../hooks/useKeypress.js';
+import { keyMatchers, Command } from '../keyMatchers.js';
 import type { CommandContext, SlashCommand } from '../commands/types.js';
-import {
-  ApprovalMode,
-  coreEvents,
-  debugLogger,
-  type Config,
-} from '@google/gemini-cli-core';
+import type { Config } from '@google/gemini-cli-core';
+import { ApprovalMode, coreEvents, debugLogger } from '@google/gemini-cli-core';
 import {
   parseInputForHighlighting,
   parseSegmentsFromTokens,
@@ -59,7 +54,6 @@ import {
   isAutoExecutableCommand,
   isSlashCommand,
 } from '../utils/commandUtils.js';
-import { parseSlashCommand } from '../../utils/commands.js';
 import * as path from 'node:path';
 import { SCREEN_READER_USER_PREFIX } from '../textConstants.js';
 import { getSafeLowColorBackground } from '../themes/color-utils.js';
@@ -77,9 +71,8 @@ import { useMouseClick } from '../hooks/useMouseClick.js';
 import { useMouse, type MouseEvent } from '../contexts/MouseContext.js';
 import { useUIActions } from '../contexts/UIActionsContext.js';
 import { useAlternateBuffer } from '../hooks/useAlternateBuffer.js';
-import { useIsHelpDismissKey } from '../utils/shortcutsHelp.js';
+import { shouldDismissShortcutsHelpOnHotkey } from '../utils/shortcutsHelp.js';
 import { useRepeatedKeyPress } from '../hooks/useRepeatedKeyPress.js';
-import { useKeyMatchers } from '../hooks/useKeyMatchers.js';
 
 /**
  * Returns if the terminal can be trusted to handle paste events atomically
@@ -213,8 +206,6 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
   suggestionsPosition = 'below',
   setBannerVisible,
 }) => {
-  const isHelpDismissKey = useIsHelpDismissKey();
-  const keyMatchers = useKeyMatchers();
   const { stdout } = useStdout();
   const { merged: settings } = useSettings();
   const kittyProtocol = useKittyKeyboardProtocol();
@@ -310,27 +301,6 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
   const resetCommandSearchCompletionState =
     commandSearchCompletion.resetCompletionState;
 
-  const getActiveCompletion = useCallback(() => {
-    if (commandSearchActive) return commandSearchCompletion;
-    if (reverseSearchActive) return reverseSearchCompletion;
-    return completion;
-  }, [
-    commandSearchActive,
-    commandSearchCompletion,
-    reverseSearchActive,
-    reverseSearchCompletion,
-    completion,
-  ]);
-
-  const activeCompletion = getActiveCompletion();
-  const shouldShowSuggestions = activeCompletion.showSuggestions;
-
-  const {
-    forceShowShellSuggestions,
-    setForceShowShellSuggestions,
-    isShellSuggestionsVisible,
-  } = completion;
-
   const showCursor = focus && isShellFocused && !isEmbeddedShellFocused;
 
   // Notify parent component about escape prompt state changes
@@ -354,9 +324,10 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
     (submittedValue: string) => {
       let processedValue = submittedValue;
       if (buffer.pastedContent) {
-        processedValue = expandPastePlaceholders(
-          processedValue,
-          buffer.pastedContent,
+        // Replace placeholders like [Pasted Text: 6 lines] with actual content
+        processedValue = processedValue.replace(
+          PASTED_TEXT_PLACEHOLDER_REGEX,
+          (match) => buffer.pastedContent[match] || match,
         );
       }
 
@@ -392,8 +363,7 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
     userMessages,
     onSubmit: handleSubmitAndClear,
     isActive:
-      (!(completion.showSuggestions && isShellSuggestionsVisible) ||
-        completion.suggestions.length === 1) &&
+      (!completion.showSuggestions || completion.suggestions.length === 1) &&
       !shellModeActive,
     currentQuery: buffer.text,
     currentCursorOffset: buffer.getOffset(),
@@ -410,17 +380,6 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
         (isSlash || isShell) &&
         streamingState === StreamingState.Responding
       ) {
-        if (isSlash) {
-          const { commandToExecute } = parseSlashCommand(
-            trimmedMessage,
-            slashCommands,
-          );
-          if (commandToExecute?.isSafeConcurrent) {
-            inputHistory.handleSubmit(trimmedMessage);
-            return;
-          }
-        }
-
         setQueueErrorMessage(
           `${isShell ? 'Shell' : 'Slash'} commands cannot be queued`,
         );
@@ -428,13 +387,7 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
       }
       inputHistory.handleSubmit(trimmedMessage);
     },
-    [
-      inputHistory,
-      shellModeActive,
-      streamingState,
-      setQueueErrorMessage,
-      slashCommands,
-    ],
+    [inputHistory, shellModeActive, streamingState, setQueueErrorMessage],
   );
 
   // Effect to reset completion if history navigation just occurred and set the text
@@ -516,14 +469,10 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
         stdout.write('\x1b]52;c;?\x07');
       } else {
         const textToInsert = await clipboardy.read();
-        const escapedText = settings.ui?.escapePastedAtSymbols
-          ? escapeAtSymbols(textToInsert)
-          : textToInsert;
-        buffer.insert(escapedText, { paste: true });
-
+        buffer.insert(textToInsert, { paste: true });
         if (isLargePaste(textToInsert)) {
           appEvents.emit(AppEvent.TransientMessage, {
-            message: `Press ${formatCommand(Command.EXPAND_PASTE)} to expand pasted text`,
+            message: 'Press Ctrl+O to expand pasted text',
             type: TransientMessageType.Hint,
           });
         }
@@ -646,7 +595,9 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
         keyMatchers[Command.END](key);
 
       const isSuggestionsNav =
-        shouldShowSuggestions &&
+        (completion.showSuggestions ||
+          reverseSearchCompletion.showSuggestions ||
+          commandSearchCompletion.showSuggestions) &&
         (keyMatchers[Command.COMPLETION_UP](key) ||
           keyMatchers[Command.COMPLETION_DOWN](key) ||
           keyMatchers[Command.EXPAND_SUGGESTION](key) ||
@@ -661,10 +612,6 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
           isHistoryNav || isCursorMovement || keyMatchers[Command.ESCAPE](key),
         );
         hasUserNavigatedSuggestions.current = false;
-
-        if (key.name !== 'tab') {
-          setForceShowShellSuggestions(false);
-        }
       }
 
       // TODO(jacobr): this special case is likely not needed anymore.
@@ -694,25 +641,15 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
       const isPlainTab =
         key.name === 'tab' && !key.shift && !key.alt && !key.ctrl && !key.cmd;
       const hasTabCompletionInteraction =
-        (completion.showSuggestions && isShellSuggestionsVisible) ||
+        completion.showSuggestions ||
         Boolean(completion.promptCompletion.text) ||
         reverseSearchActive ||
         commandSearchActive;
 
       if (isPlainTab && shellModeActive) {
         resetPlainTabPress();
-        if (!shouldShowSuggestions) {
+        if (!completion.showSuggestions) {
           setSuppressCompletion(false);
-          if (completion.promptCompletion.text) {
-            completion.promptCompletion.accept();
-            return true;
-          } else if (
-            completion.suggestions.length > 0 &&
-            !forceShowShellSuggestions
-          ) {
-            setForceShowShellSuggestions(true);
-            return true;
-          }
         }
       } else if (isPlainTab) {
         if (!hasTabCompletionInteraction) {
@@ -755,25 +692,18 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
             pasteTimeoutRef.current = null;
           }, 40);
         }
-        if (settings.ui?.escapePastedAtSymbols) {
-          buffer.handleInput({
-            ...key,
-            sequence: escapeAtSymbols(key.sequence || ''),
-          });
-        } else {
-          buffer.handleInput(key);
-        }
-
+        // Ensure we never accidentally interpret paste as regular input.
+        buffer.handleInput(key);
         if (key.sequence && isLargePaste(key.sequence)) {
           appEvents.emit(AppEvent.TransientMessage, {
-            message: `Press ${formatCommand(Command.EXPAND_PASTE)} to expand pasted text`,
+            message: 'Press Ctrl+O to expand pasted text',
             type: TransientMessageType.Hint,
           });
         }
         return true;
       }
 
-      if (shortcutsHelpVisible && isHelpDismissKey(key)) {
+      if (shortcutsHelpVisible && shouldDismissShortcutsHelpOnHotkey(key)) {
         setShortcutsHelpVisible(false);
       }
 
@@ -822,7 +752,7 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
       if (
         key.sequence === '!' &&
         buffer.text === '' &&
-        !(completion.showSuggestions && isShellSuggestionsVisible)
+        !completion.showSuggestions
       ) {
         setShellModeActive(!shellModeActive);
         buffer.setText(''); // Clear the '!' from input
@@ -838,7 +768,7 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
           resetCompletion();
           buffer.setText(textBeforeReverseSearch);
           const offset = logicalPosToOffset(
-            buffer.lines,
+            buffer.store.split('\n'),
             cursorPosition[0],
             cursorPosition[1],
           );
@@ -861,15 +791,15 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
           return true;
         }
 
-        if (completion.showSuggestions && isShellSuggestionsVisible) {
-          completion.resetCompletionState();
-          setExpandedSuggestionIndex(-1);
+        if (shellModeActive) {
+          setShellModeActive(false);
           resetEscapeState();
           return true;
         }
 
-        if (shellModeActive) {
-          setShellModeActive(false);
+        if (completion.showSuggestions) {
+          completion.resetCompletionState();
+          setExpandedSuggestionIndex(-1);
           resetEscapeState();
           return true;
         }
@@ -965,7 +895,7 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
         completion.isPerfectMatch &&
         keyMatchers[Command.SUBMIT](key) &&
         recentUnsafePasteTime === null &&
-        (!(completion.showSuggestions && isShellSuggestionsVisible) ||
+        (!completion.showSuggestions ||
           (completion.activeSuggestionIndex <= 0 &&
             !hasUserNavigatedSuggestions.current))
       ) {
@@ -979,7 +909,7 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
         return true;
       }
 
-      if (completion.showSuggestions && isShellSuggestionsVisible) {
+      if (completion.showSuggestions) {
         if (completion.suggestions.length > 1) {
           if (keyMatchers[Command.COMPLETION_UP](key)) {
             completion.navigateUp();
@@ -1005,7 +935,7 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
             if (targetIndex < completion.suggestions.length) {
               const suggestion = completion.suggestions[targetIndex];
 
-              const isEnterKey = key.name === 'enter' && !key.ctrl;
+              const isEnterKey = key.name === 'return' && !key.ctrl;
 
               if (isEnterKey && shellModeActive) {
                 if (hasUserNavigatedSuggestions.current) {
@@ -1026,12 +956,6 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
               }
 
               if (isEnterKey && buffer.text.startsWith('/')) {
-                if (suggestion.submitValue) {
-                  setExpandedSuggestionIndex(-1);
-                  handleSubmit(suggestion.submitValue.trim());
-                  return true;
-                }
-
                 const { isArgumentCompletion, leafCommand } =
                   completion.slashCompletionRange;
 
@@ -1083,7 +1007,7 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
       if (
         key.name === 'tab' &&
         !key.shift &&
-        !(completion.showSuggestions && isShellSuggestionsVisible) &&
+        !completion.showSuggestions &&
         completion.promptCompletion.text
       ) {
         completion.promptCompletion.accept();
@@ -1173,7 +1097,7 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
           }
 
           const [row, col] = buffer.cursor;
-          const line = buffer.lines[row];
+          const line = buffer.store[row] ?? '';
           const charBefore = col > 0 ? cpSlice(line, col - 1, col) : '';
           if (charBefore === '\\') {
             buffer.backspace();
@@ -1266,7 +1190,6 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
       focus,
       buffer,
       completion,
-      setForceShowShellSuggestions,
       shellModeActive,
       setShellModeActive,
       onClearScreen,
@@ -1298,12 +1221,6 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
       registerPlainTabPress,
       resetPlainTabPress,
       toggleCleanUiDetailsVisible,
-      shouldShowSuggestions,
-      isShellSuggestionsVisible,
-      forceShowShellSuggestions,
-      keyMatchers,
-      isHelpDismissKey,
-      settings,
     ],
   );
 
@@ -1333,7 +1250,7 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
       return { inlineGhost: '', additionalLines: [] };
     }
 
-    const currentLogicalLine = buffer.lines[buffer.cursor[0]] || '';
+    const currentLogicalLine = buffer.store[buffer.cursor[0]] || '';
     const cursorCol = buffer.cursor[1];
 
     const textBeforeCursor = cpSlice(currentLogicalLine, 0, cursorCol);
@@ -1423,12 +1340,20 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
   }, [
     completion.promptCompletion.text,
     buffer.text,
-    buffer.lines,
+    buffer.store,
     buffer.cursor,
     inputWidth,
   ]);
 
   const { inlineGhost, additionalLines } = getGhostTextLines();
+  const getActiveCompletion = () => {
+    if (commandSearchActive) return commandSearchCompletion;
+    if (reverseSearchActive) return reverseSearchCompletion;
+    return completion;
+  };
+
+  const activeCompletion = getActiveCompletion();
+  const shouldShowSuggestions = activeCompletion.showSuggestions;
 
   const useBackgroundColor = config.getUseBackgroundColor();
   const isLowColor = isLowColorDepth();
@@ -1502,7 +1427,7 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
 
   const borderColor =
     isShellFocused && !isEmbeddedShellFocused
-      ? (statusColor ?? theme.ui.focus)
+      ? (statusColor ?? theme.border.focused)
       : theme.border.default;
 
   return (
@@ -1592,7 +1517,7 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
                   const renderedLine: React.ReactNode[] = [];
 
                   const [logicalLineIdx] = mapEntry;
-                  const logicalLine = buffer.lines[logicalLineIdx] || '';
+                  const logicalLine = buffer.store[logicalLineIdx] || '';
                   const transformations =
                     buffer.transformationsByLine[logicalLineIdx] ?? [];
                   const tokens = parseInputForHighlighting(

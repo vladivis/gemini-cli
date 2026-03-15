@@ -1,0 +1,19 @@
+{
+  "name": "@google/gemini-cli-native-core",
+  "version": "0.1.0",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "napi": {
+    "binaryName": "gemini-cli-native-core",
+    "package": {
+      "name": "@google/gemini-cli-native-core"
+    }
+  },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.5.1"
+  }
+}

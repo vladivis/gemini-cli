@@ -1,0 +1,15 @@
+[package]
+name = "gemini_cli_native_core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "2.12", features = ["async"] }
+napi-derive = "2.12"
+ropey = "1.6"
+
+[build-dependencies]
+napi-build = "2.0"

@@ -84,8 +84,13 @@ function toHaveOnlyValidCharacters(this: Assertion, buffer: TextBuffer) {
   let pass = true;
   const invalidLines: Array<{ line: number; content: string }> = [];
 
-  for (let i = 0; i < buffer.lines.length; i++) {
-    const line = buffer.lines[i];
+  const store = buffer.store;
+  const lineCount = typeof store.lenLines === 'function' ? store.lenLines() : (store as any).length;
+
+  for (let i = 0; i < lineCount; i++) {
+    const line = typeof store.getLine === 'function' ? store.getLine(i) : (store as any)[i];
+    if (line === undefined) continue;
+    
     if (line.includes('\n')) {
       pass = false;
       invalidLines.push({ line: i, content: line });
@@ -101,9 +106,9 @@ function toHaveOnlyValidCharacters(this: Assertion, buffer: TextBuffer) {
     pass,
     message: () =>
       `Expected buffer ${isNot ? 'not ' : ''}to have only valid characters, but found invalid characters in lines:\n${invalidLines
-        .map((l) => `  [${l.line}]: "${l.content}"`) /* This line was changed */
+        .map((l) => `  [${l.line}]: "${l.content}"`)
         .join('\n')}`,
-    actual: buffer.lines,
+    actual: store,
     expected: 'Lines with no line breaks, backspaces, or escape codes.',
   };
 }

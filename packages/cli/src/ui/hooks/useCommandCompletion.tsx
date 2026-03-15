@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useCallback, useMemo, useEffect, useState } from 'react';
+import { useCallback, useMemo, useEffect } from 'react';
 import type { Suggestion } from '../components/SuggestionsDisplay.js';
 import type { CommandContext, SlashCommand } from '../commands/types.js';
 import type { TextBuffer } from '../components/shared/text-buffer.js';
@@ -14,10 +14,10 @@ import { toCodePoints } from '../utils/textUtils.js';
 import { useAtCompletion } from './useAtCompletion.js';
 import { useSlashCompletion } from './useSlashCompletion.js';
 import { useShellCompletion } from './useShellCompletion.js';
+import type { PromptCompletion } from './usePromptCompletion.js';
 import {
   usePromptCompletion,
   PROMPT_COMPLETION_MIN_LENGTH,
-  type PromptCompletion,
 } from './usePromptCompletion.js';
 import type { Config } from '@google/gemini-cli-core';
 import { useCompletion } from './useCompletion.js';
@@ -37,9 +37,6 @@ export interface UseCommandCompletionReturn {
   showSuggestions: boolean;
   isLoadingSuggestions: boolean;
   isPerfectMatch: boolean;
-  forceShowShellSuggestions: boolean;
-  setForceShowShellSuggestions: (value: boolean) => void;
-  isShellSuggestionsVisible: boolean;
   setActiveSuggestionIndex: React.Dispatch<React.SetStateAction<number>>;
   resetCompletionState: () => void;
   navigateUp: () => void;
@@ -83,9 +80,6 @@ export function useCommandCompletion({
   config,
   active,
 }: UseCommandCompletionOptions): UseCommandCompletionReturn {
-  const [forceShowShellSuggestions, setForceShowShellSuggestions] =
-    useState(false);
-
   const {
     suggestions,
     activeSuggestionIndex,
@@ -99,15 +93,10 @@ export function useCommandCompletion({
     setIsPerfectMatch,
     setVisibleStartIndex,
 
-    resetCompletionState: baseResetCompletionState,
+    resetCompletionState,
     navigateUp,
     navigateDown,
   } = useCompletion();
-
-  const resetCompletionState = useCallback(() => {
-    baseResetCompletionState();
-    setForceShowShellSuggestions(false);
-  }, [baseResetCompletionState]);
 
   const cursorRow = buffer.cursor[0];
   const cursorCol = buffer.cursor[1];
@@ -118,7 +107,7 @@ export function useCommandCompletion({
     completionStart,
     completionEnd,
   } = useMemo(() => {
-    const currentLine = buffer.lines[cursorRow] || '';
+    const currentLine = buffer.store[cursorRow] || '';
     const codePoints = toCodePoints(currentLine);
 
     if (shellModeActive) {
@@ -206,7 +195,7 @@ export function useCommandCompletion({
       completionStart: -1,
       completionEnd: -1,
     };
-  }, [cursorRow, cursorCol, buffer.lines, buffer.text, shellModeActive]);
+  }, [cursorRow, cursorCol, buffer.store, buffer.text, shellModeActive]);
 
   useAtCompletion({
     enabled: active && completionMode === CompletionMode.AT,
@@ -230,7 +219,7 @@ export function useCommandCompletion({
 
   const shellCompletionRange = useShellCompletion({
     enabled: active && completionMode === CompletionMode.SHELL,
-    line: buffer.lines[cursorRow] || '',
+    line: buffer.store[cursorRow] || '',
     cursorCol,
     cwd,
     setSuggestions,
@@ -242,72 +231,9 @@ export function useCommandCompletion({
       ? shellCompletionRange.query
       : memoQuery;
 
-  const basePromptCompletion = usePromptCompletion({
+  const promptCompletion = usePromptCompletion({
     buffer,
   });
-
-  const isShellSuggestionsVisible =
-    completionMode !== CompletionMode.SHELL || forceShowShellSuggestions;
-
-  const promptCompletion = useMemo(() => {
-    if (
-      completionMode === CompletionMode.SHELL &&
-      suggestions.length === 1 &&
-      query != null &&
-      shellCompletionRange.completionStart === shellCompletionRange.activeStart
-    ) {
-      const suggestion = suggestions[0];
-      const textToInsertBase = suggestion.value;
-
-      if (
-        textToInsertBase.startsWith(query) &&
-        textToInsertBase.length > query.length
-      ) {
-        const currentLine = buffer.lines[cursorRow] || '';
-        const start = shellCompletionRange.completionStart;
-        const end = shellCompletionRange.completionEnd;
-
-        let textToInsert = textToInsertBase;
-        const charAfterCompletion = currentLine[end];
-        if (
-          charAfterCompletion !== ' ' &&
-          !textToInsert.endsWith('/') &&
-          !textToInsert.endsWith('\\')
-        ) {
-          textToInsert += ' ';
-        }
-
-        const newText =
-          currentLine.substring(0, start) +
-          textToInsert +
-          currentLine.substring(end);
-
-        return {
-          text: newText,
-          isActive: true,
-          isLoading: false,
-          accept: () => {
-            buffer.replaceRangeByOffset(
-              logicalPosToOffset(buffer.lines, cursorRow, start),
-              logicalPosToOffset(buffer.lines, cursorRow, end),
-              textToInsert,
-            );
-          },
-          clear: () => {},
-          markSelected: () => {},
-        };
-      }
-    }
-    return basePromptCompletion;
-  }, [
-    completionMode,
-    suggestions,
-    query,
-    basePromptCompletion,
-    buffer,
-    cursorRow,
-    shellCompletionRange,
-  ]);
 
   useEffect(() => {
     setActiveSuggestionIndex(suggestions.length > 0 ? 0 : -1);
@@ -345,7 +271,6 @@ export function useCommandCompletion({
     active &&
     completionMode !== CompletionMode.IDLE &&
     !reverseSearchActive &&
-    isShellSuggestionsVisible &&
     (isLoadingSuggestions || suggestions.length > 0);
 
   /**
@@ -357,7 +282,7 @@ export function useCommandCompletion({
    */
   const getCompletedText = useCallback(
     (suggestion: Suggestion): string | null => {
-      const currentLine = buffer.lines[cursorRow] || '';
+      const currentLine = buffer.store[cursorRow] || '';
 
       let start = completionStart;
       let end = completionEnd;
@@ -374,7 +299,7 @@ export function useCommandCompletion({
       }
 
       // Apply space padding for slash commands (needed for subcommands like "/chat list")
-      let suggestionText = suggestion.insertValue ?? suggestion.value;
+      let suggestionText = suggestion.value;
       if (completionMode === CompletionMode.SLASH) {
         // Add leading space if completing a subcommand (cursor is after parent command with no space)
         if (start === end && start > 1 && currentLine[start - 1] !== ' ') {
@@ -391,7 +316,7 @@ export function useCommandCompletion({
     },
     [
       cursorRow,
-      buffer.lines,
+      buffer.store,
       completionMode,
       completionStart,
       completionEnd,
@@ -423,18 +348,18 @@ export function useCommandCompletion({
       }
 
       // Add space padding for Tab completion (auto-execute gets padding from getCompletedText)
-      let suggestionText = suggestion.insertValue ?? suggestion.value;
+      let suggestionText = suggestion.value;
       if (completionMode === CompletionMode.SLASH) {
         if (
           start === end &&
           start > 1 &&
-          (buffer.lines[cursorRow] || '')[start - 1] !== ' '
+          (buffer.store[cursorRow] || '')[start - 1] !== ' '
         ) {
           suggestionText = ' ' + suggestionText;
         }
       }
 
-      const lineCodePoints = toCodePoints(buffer.lines[cursorRow] || '');
+      const lineCodePoints = toCodePoints(buffer.store[cursorRow] || '');
       const charAfterCompletion = lineCodePoints[end];
       if (
         charAfterCompletion !== ' ' &&
@@ -445,8 +370,8 @@ export function useCommandCompletion({
       }
 
       buffer.replaceRangeByOffset(
-        logicalPosToOffset(buffer.lines, cursorRow, start),
-        logicalPosToOffset(buffer.lines, cursorRow, end),
+        logicalPosToOffset(buffer.store.split('\n'), cursorRow, start),
+        logicalPosToOffset(buffer.store.split('\n'), cursorRow, end),
         suggestionText,
       );
     },
@@ -470,9 +395,6 @@ export function useCommandCompletion({
     showSuggestions,
     isLoadingSuggestions,
     isPerfectMatch,
-    forceShowShellSuggestions,
-    setForceShowShellSuggestions,
-    isShellSuggestionsVisible,
     setActiveSuggestionIndex,
     resetCompletionState,
     navigateUp,

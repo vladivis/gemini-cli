@@ -62,5 +62,19 @@ gemini-debug.log
 .gemini-clipboard/
 .eslintcache
 evals/logs/
+.worktrees/
 
-temp_agents/
+# Sub-agent orchestration artifacts
+.gemini/swarm/
+.worktrees/
+TASK_COMPLETE.md
+TASK_RUNNING.md
+refactor_task.txt
+
+# Rust and Native build artifacts
+packages/native-core/target/
+packages/native-core/*.node
+packages/native-core/index.js
+packages/native-core/index.d.ts
+STRESS_TEST.txt
+A2A_LOGS.txt

@@ -18,7 +18,6 @@ import {
   type AuthType,
   type AgentOverride,
   type CustomTheme,
-  type SandboxConfig,
 } from '@google/gemini-cli-core';
 import type { SessionRetentionSettings } from './settings.js';
 import { DEFAULT_MIN_RETENTION } from '../utils/sessionCleanup.js';
@@ -135,18 +134,6 @@ export interface SettingsSchema {
 export type MemoryImportFormat = 'tree' | 'flat';
 export type DnsResolutionOrder = 'ipv4first' | 'verbatim';
 
-const pathArraySetting = (label: string, description: string) => ({
-  type: 'array' as const,
-  label,
-  category: 'Advanced' as const,
-  requiresRestart: true as const,
-  default: [] as string[],
-  description,
-  showInDialog: false as const,
-  items: { type: 'string' as const },
-  mergeStrategy: MergeStrategy.UNION,
-});
-
 /**
  * The canonical schema for all settings.
  * The structure of this object defines the structure of the `Settings` type.
@@ -169,15 +156,17 @@ const SETTINGS_SCHEMA = {
     },
   },
 
-  policyPaths: pathArraySetting(
-    'Policy Paths',
-    'Additional policy files or directories to load.',
-  ),
-
-  adminPolicyPaths: pathArraySetting(
-    'Admin Policy Paths',
-    'Additional admin policy files or directories to load.',
-  ),
+  policyPaths: {
+    type: 'array',
+    label: 'Policy Paths',
+    category: 'Advanced',
+    requiresRestart: true,
+    default: [] as string[],
+    description: 'Additional policy files or directories to load.',
+    showInDialog: false,
+    items: { type: 'string' },
+    mergeStrategy: MergeStrategy.UNION,
+  },
 
   general: {
     type: 'object',
@@ -215,8 +204,7 @@ const SETTINGS_SCHEMA = {
         description: oneLine`
           The default approval mode for tool execution.
           'default' prompts for approval, 'auto_edit' auto-approves edit tools,
-          and 'plan' is read-only mode. YOLO mode (auto-approve all actions) can
-          only be enabled via command line (--yolo or --approval-mode=yolo).
+          and 'plan' is read-only mode. 'yolo' is not supported yet.
         `,
         showInDialog: true,
         options: [
@@ -318,10 +306,10 @@ const SETTINGS_SCHEMA = {
         label: 'Retry Fetch Errors',
         category: 'General',
         requiresRestart: false,
-        default: true,
+        default: false,
         description:
           'Retry on "exception TypeError: fetch failed sending request" errors.',
-        showInDialog: true,
+        showInDialog: false,
       },
       maxAttempts: {
         type: 'number',
@@ -540,16 +528,6 @@ const SETTINGS_SCHEMA = {
         description: 'Hide helpful tips in the UI',
         showInDialog: true,
       },
-      escapePastedAtSymbols: {
-        type: 'boolean',
-        label: 'Escape Pasted @ Symbols',
-        category: 'UI',
-        requiresRestart: false,
-        default: false,
-        description:
-          'When enabled, @ symbols in pasted text are escaped to prevent unintended @path expansion.',
-        showInDialog: true,
-      },
       showShortcutsHint: {
         type: 'boolean',
         label: 'Show Shortcuts Hint',
@@ -587,34 +565,14 @@ const SETTINGS_SCHEMA = {
         description: 'Settings for the footer.',
         showInDialog: false,
         properties: {
-          items: {
-            type: 'array',
-            label: 'Footer Items',
-            category: 'UI',
-            requiresRestart: false,
-            default: undefined as string[] | undefined,
-            description:
-              'List of item IDs to display in the footer. Rendered in order',
-            showInDialog: false,
-            items: { type: 'string' },
-          },
-          showLabels: {
-            type: 'boolean',
-            label: 'Show Footer Labels',
-            category: 'UI',
-            requiresRestart: false,
-            default: true,
-            description:
-              'Display a second line above the footer items with descriptive headers (e.g., /model).',
-            showInDialog: false,
-          },
           hideCWD: {
             type: 'boolean',
             label: 'Hide CWD',
             category: 'UI',
             requiresRestart: false,
             default: false,
-            description: 'Hide the current working directory in the footer.',
+            description:
+              'Hide the current working directory path in the footer.',
             showInDialog: true,
           },
           hideSandboxStatus: {
@@ -698,7 +656,7 @@ const SETTINGS_SCHEMA = {
         requiresRestart: false,
         default: true,
         description:
-          "Show the signed-in user's identity (e.g. email) in the UI.",
+          "Show the logged-in user's identity (e.g. email) in the UI.",
         showInDialog: true,
       },
       useAlternateBuffer: {
@@ -1039,20 +997,6 @@ const SETTINGS_SCHEMA = {
           'Apply specific configuration overrides based on matches, with a primary key of model (or alias). The most specific match will be used.',
         showInDialog: false,
       },
-      modelDefinitions: {
-        type: 'object',
-        label: 'Model Definitions',
-        category: 'Model',
-        requiresRestart: true,
-        default: DEFAULT_MODEL_CONFIGS.modelDefinitions,
-        description:
-          'Registry of model metadata, including tier, family, and features.',
-        showInDialog: false,
-        additionalProperties: {
-          type: 'object',
-          ref: 'ModelDefinition',
-        },
-      },
     },
   },
 
@@ -1131,29 +1075,6 @@ const SETTINGS_SCHEMA = {
             description: 'Model override for the visual agent.',
             showInDialog: false,
           },
-          allowedDomains: {
-            type: 'array',
-            label: 'Allowed Domains',
-            category: 'Advanced',
-            requiresRestart: true,
-            default: ['github.com', '*.google.com', 'localhost'] as string[],
-            description: oneLine`
-              A list of allowed domains for the browser agent
-              (e.g., ["github.com", "*.google.com"]).
-            `,
-            showInDialog: false,
-            items: { type: 'string' },
-          },
-          disableUserInput: {
-            type: 'boolean',
-            label: 'Disable User Input',
-            category: 'Advanced',
-            requiresRestart: false,
-            default: true,
-            description:
-              'Disable user input on browser window during automation.',
-            showInDialog: false,
-          },
         },
       },
     },
@@ -1228,7 +1149,7 @@ const SETTINGS_SCHEMA = {
         requiresRestart: false,
         default: false,
         description: oneLine`
-          Controls how /memory reload loads GEMINI.md files.
+          Controls how /memory refresh loads GEMINI.md files.
           When true, include directories are scanned; when false, only the current directory is used.
         `,
         showInDialog: true,
@@ -1311,12 +1232,11 @@ const SETTINGS_SCHEMA = {
         label: 'Sandbox',
         category: 'Tools',
         requiresRestart: true,
-        default: undefined as boolean | string | SandboxConfig | undefined,
-        ref: 'BooleanOrStringOrObject',
+        default: undefined as boolean | string | undefined,
+        ref: 'BooleanOrString',
         description: oneLine`
-          Legacy full-process sandbox execution environment.
-          Set to a boolean to enable or disable the sandbox, provide a string path to a sandbox profile,
-          or specify an explicit sandbox command (e.g., "docker", "podman", "lxc").
+          Sandbox execution environment.
+          Set to a boolean to enable or disable the sandbox, or provide a string path to a sandbox profile.
         `,
         showInDialog: false,
       },
@@ -1536,16 +1456,6 @@ const SETTINGS_SCHEMA = {
     description: 'Security-related settings.',
     showInDialog: false,
     properties: {
-      toolSandboxing: {
-        type: 'boolean',
-        label: 'Tool Sandboxing',
-        category: 'Security',
-        requiresRestart: false,
-        default: false,
-        description:
-          'Experimental tool-level sandboxing (implementation in progress).',
-        showInDialog: true,
-      },
       disableYoloMode: {
         type: 'boolean',
         label: 'Disable YOLO Mode',
@@ -1553,16 +1463,6 @@ const SETTINGS_SCHEMA = {
         requiresRestart: true,
         default: false,
         description: 'Disable YOLO mode, even if enabled by a flag.',
-        showInDialog: true,
-      },
-      disableAlwaysAllow: {
-        type: 'boolean',
-        label: 'Disable Always Allow',
-        category: 'Security',
-        requiresRestart: true,
-        default: false,
-        description:
-          'Disable "Always allow" options in tool confirmation dialogs.',
         showInDialog: true,
       },
       enablePermanentToolApproval: {
@@ -1573,18 +1473,6 @@ const SETTINGS_SCHEMA = {
         default: false,
         description:
           'Enable the "Allow for all future sessions" option in tool confirmation dialogs.',
-        showInDialog: true,
-      },
-      autoAddToPolicyByDefault: {
-        type: 'boolean',
-        label: 'Auto-add to Policy by Default',
-        category: 'Security',
-        requiresRestart: false,
-        default: false,
-        description: oneLine`
-          When enabled, the "Allow for all future sessions" option becomes the
-          default choice for low-risk tools in trusted workspaces.
-        `,
         showInDialog: true,
       },
       blockGitExtensions: {
@@ -1781,6 +1669,15 @@ const SETTINGS_SCHEMA = {
     description: 'Setting to enable experimental features',
     showInDialog: false,
     properties: {
+      useNativeBuffer: {
+        type: 'boolean',
+        label: 'Use Native Text Buffer',
+        category: 'Experimental',
+        requiresRestart: true,
+        default: false,
+        description:
+          'Enable high-performance native Rust core for text buffers. Significantly improves memory efficiency and speed for large files.',
+      },
       toolOutputMasking: {
         type: 'object',
         label: 'Tool Output Masking',
@@ -1870,16 +1767,6 @@ const SETTINGS_SCHEMA = {
         description: 'Enable extension registry explore UI.',
         showInDialog: false,
       },
-      extensionRegistryURI: {
-        type: 'string',
-        label: 'Extension Registry URI',
-        category: 'Experimental',
-        requiresRestart: true,
-        default: 'https://geminicli.com/extensions.json',
-        description:
-          'The URI (web URL or local file path) of the extension registry.',
-        showInDialog: false,
-      },
       extensionReloading: {
         type: 'boolean',
         label: 'Extension Reloading',
@@ -1928,15 +1815,6 @@ const SETTINGS_SCHEMA = {
         description: 'Enable Plan Mode.',
         showInDialog: true,
       },
-      taskTracker: {
-        type: 'boolean',
-        label: 'Task Tracker',
-        category: 'Experimental',
-        requiresRestart: true,
-        default: false,
-        description: 'Enable task tracker tools.',
-        showInDialog: false,
-      },
       modelSteering: {
         type: 'boolean',
         label: 'Model Steering',
@@ -1957,16 +1835,6 @@ const SETTINGS_SCHEMA = {
           'Enable web fetch behavior that bypasses LLM summarization.',
         showInDialog: true,
       },
-      dynamicModelConfiguration: {
-        type: 'boolean',
-        label: 'Dynamic Model Configuration',
-        category: 'Experimental',
-        requiresRestart: true,
-        default: false,
-        description:
-          'Enable dynamic model configuration (definitions, resolutions, and chains) via settings.',
-        showInDialog: false,
-      },
       gemmaModelRouter: {
         type: 'object',
         label: 'Gemma Model Router',
@@ -1974,7 +1842,7 @@ const SETTINGS_SCHEMA = {
         requiresRestart: true,
         default: {},
         description: 'Enable Gemma model router (experimental).',
-        showInDialog: false,
+        showInDialog: true,
         properties: {
           enabled: {
             type: 'boolean',
@@ -1983,8 +1851,8 @@ const SETTINGS_SCHEMA = {
             requiresRestart: true,
             default: false,
             description:
-              'Enable the Gemma Model Router (experimental). Requires a local endpoint serving Gemma via the Gemini API using LiteRT-LM shim.',
-            showInDialog: false,
+              'Enable the Gemma Model Router. Requires a local endpoint serving Gemma via the Gemini API using LiteRT-LM shim.',
+            showInDialog: true,
           },
           classifier: {
             type: 'object',
@@ -2018,18 +1886,9 @@ const SETTINGS_SCHEMA = {
           },
         },
       },
-      topicUpdateNarration: {
-        type: 'boolean',
-        label: 'Topic & Update Narration',
-        category: 'Experimental',
-        requiresRestart: false,
-        default: false,
-        description:
-          'Enable the experimental Topic & Update communication model for reduced chattiness and structured progress reporting.',
-        showInDialog: true,
-      },
     },
   },
+
   extensions: {
     type: 'object',
     label: 'Extensions',
@@ -2310,8 +2169,7 @@ const SETTINGS_SCHEMA = {
         category: 'Admin',
         requiresRestart: false,
         default: false,
-        description:
-          'If true, disallows YOLO mode and "Always allow" options from being used.',
+        description: 'If true, disallows yolo mode from being used.',
         showInDialog: false,
         mergeStrategy: MergeStrategy.REPLACE,
       },
@@ -2706,44 +2564,9 @@ export const SETTINGS_SCHEMA_DEFINITIONS: Record<
     description: 'Accepts either a single string or an array of strings.',
     anyOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
   },
-  BooleanOrStringOrObject: {
-    description:
-      'Accepts either a boolean flag, a string command name, or a configuration object.',
-    anyOf: [
-      { type: 'boolean' },
-      { type: 'string' },
-      {
-        type: 'object',
-        description: 'Sandbox configuration object.',
-        additionalProperties: false,
-        properties: {
-          enabled: {
-            type: 'boolean',
-            description: 'Enables or disables the sandbox.',
-          },
-          command: {
-            type: 'string',
-            description:
-              'The sandbox command to use (docker, podman, sandbox-exec, runsc, lxc).',
-            enum: ['docker', 'podman', 'sandbox-exec', 'runsc', 'lxc'],
-          },
-          image: {
-            type: 'string',
-            description: 'The sandbox image to use.',
-          },
-          allowedPaths: {
-            type: 'array',
-            description:
-              'A list of absolute host paths that should be accessible within the sandbox.',
-            items: { type: 'string' },
-          },
-          networkAccess: {
-            type: 'boolean',
-            description: 'Whether the sandbox should have internet access.',
-          },
-        },
-      },
-    ],
+  BooleanOrString: {
+    description: 'Accepts either a boolean flag or a string command name.',
+    anyOf: [{ type: 'boolean' }, { type: 'string' }],
   },
   HookDefinitionArray: {
     type: 'array',
@@ -2793,25 +2616,6 @@ export const SETTINGS_SCHEMA_DEFINITIONS: Record<
       },
     },
   },
-  ModelDefinition: {
-    type: 'object',
-    description: 'Model metadata registry entry.',
-    properties: {
-      displayName: { type: 'string' },
-      tier: { enum: ['pro', 'flash', 'flash-lite', 'custom', 'auto'] },
-      family: { type: 'string' },
-      isPreview: { type: 'boolean' },
-      dialogLocation: { enum: ['main', 'manual'] },
-      dialogDescription: { type: 'string' },
-      features: {
-        type: 'object',
-        properties: {
-          thinking: { type: 'boolean' },
-          multimodalToolUse: { type: 'boolean' },
-        },
-      },
-    },
-  },
 };
 
 export function getSettingsSchema(): SettingsSchemaType {
@@ -2829,9 +2633,7 @@ type InferSettings<T extends SettingsSchema> = {
         ? boolean
         : T[K]['default'] extends string
           ? string
-          : T[K]['default'] extends ReadonlyArray<infer U>
-            ? U[]
-            : T[K]['default'];
+          : T[K]['default'];
 };
 
 type InferMergedSettings<T extends SettingsSchema> = {
@@ -2845,9 +2647,7 @@ type InferMergedSettings<T extends SettingsSchema> = {
         ? boolean
         : T[K]['default'] extends string
           ? string
-          : T[K]['default'] extends ReadonlyArray<infer U>
-            ? U[]
-            : T[K]['default'];
+          : T[K]['default'];
 };
 
 export type Settings = InferSettings<SettingsSchemaType>;

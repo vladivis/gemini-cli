@@ -8,7 +8,118 @@ import fs from 'node:fs';
 import os from 'node:os';
 import pathMod from 'node:path';
 import * as path from 'node:path';
-import { useState, useCallback, useEffect, useMemo, useReducer } from 'react';
+import { createRequire } from 'node:module';
+import { useState, useCallback, useEffect, useMemo, useReducer, useRef } from 'react';
+
+const require = createRequire(import.meta.url);
+
+// --- Native Bridge for Performance ---
+export interface TextStore {
+  insert(charIdx: number, text: string): void;
+  delete(start: number, end: number): void;
+  getLine(lineIdx: number): string | undefined;
+  lenLines(): number;
+  getText(): string;
+  clone(): TextStore;
+  split(separator: string): string[];
+  join(separator: string): string;
+  readonly length: number; // for array-like access compatibility
+  [index: number]: string | undefined;
+}
+
+class FallbackTextStore implements TextStore {
+  private lines: string[];
+  constructor(initialText: string | string[]) {
+    this.lines = Array.isArray(initialText) ? [...initialText] : initialText.split('\n');
+  }
+  insert(charIdx: number, text: string) {
+    const fullText = this.getText();
+    const newText = fullText.slice(0, charIdx) + text + fullText.slice(charIdx);
+    this.lines = newText.split('\n');
+  }
+  delete(start: number, end: number) {
+    const fullText = this.getText();
+    const newText = fullText.slice(0, start) + fullText.slice(end);
+    this.lines = newText.split('\n');
+  }
+  getLine(lineIdx: number) { return this.lines[lineIdx]; }
+  lenLines() { return this.lines.length; }
+  getText() { return this.lines.join('\n'); }
+  clone() { return new FallbackTextStore([...this.lines]); }
+  split(sep: string) { return this.getText().split(sep); }
+  join(sep: string) { return this.lines.join(sep); }
+  get length() { return this.lines.length; }
+  // Proxy numeric index access to the lines array
+  [index: number]: string | undefined;
+}
+
+// Update FallbackTextStore to handle index access via Proxy
+const createFallbackStore = (text: string | string[]): TextStore => {
+  const store = new FallbackTextStore(text);
+  return new Proxy(store, {
+    get(target, prop) {
+      if (typeof prop === 'string' && !isNaN(Number(prop))) {
+        return target.getLine(Number(prop));
+      }
+      return (target as any)[prop];
+    }
+  }) as TextStore;
+};
+
+class NativeTextStore implements TextStore {
+  private native: any;
+  constructor(initialText: string, nativeModule: any) {
+    this.native = typeof initialText === 'string' 
+      ? new nativeModule.RopeBuffer(initialText)
+      : initialText; // Handle passing the native object directly for cloning
+  }
+  insert(charIdx: number, text: string) { this.native.insert(charIdx, text); }
+  delete(start: number, end: number) { this.native.delete(start, end); }
+  getLine(lineIdx: number) {
+    const line = this.native.getLine(lineIdx);
+    if (line === undefined) return undefined;
+    return line.endsWith('\n') ? line.slice(0, -1) : line;
+  }
+  lenLines() { return this.native.lenLines(); }
+  getText() { return this.native.getText(); }
+  clone() { return new NativeTextStore(this.native.cloneBuffer(), nativeModule); }
+  split(sep: string) { return this.getText().split(sep); }
+  join(sep: string) { return this.getText().split('\n').join(sep); }
+  get length() { return this.lenLines(); }
+  [index: number]: string | undefined;
+}
+
+const createNativeStore = (text: string, nativeModule: any): TextStore => {
+  const store = new NativeTextStore(text, nativeModule);
+  return new Proxy(store, {
+    get(target, prop) {
+      if (typeof prop === 'string' && !isNaN(Number(prop))) {
+        return target.getLine(Number(prop));
+      }
+      return (target as any)[prop];
+    }
+  }) as TextStore;
+};
+
+let nativeModule: any = null;
+
+try {
+  nativeModule = require('@google/gemini-cli-native-core');
+} catch (e) {
+  // Fallback to JS silently
+}
+
+import { useSettings } from '../../contexts/SettingsContext.js';
+
+// ... other imports ...
+
+export function createTextStore(text: string | string[], forceNative = false): TextStore {
+  const initialText = Array.isArray(text) ? text.join('\n') : text;
+  return (nativeModule && forceNative) 
+    ? createNativeStore(initialText, nativeModule) 
+    : createFallbackStore(text);
+}
+// ------------------------------------
 import { LRUCache } from 'mnemonist';
 import {
   coreEvents,
@@ -25,12 +136,11 @@ import {
 } from '../../utils/textUtils.js';
 import { parsePastedPaths } from '../../utils/clipboardUtils.js';
 import type { Key } from '../../contexts/KeypressContext.js';
-import { Command } from '../../key/keyMatchers.js';
+import { keyMatchers, Command } from '../../keyMatchers.js';
 import type { VimAction } from './vim-buffer-actions.js';
 import { handleVimAction } from './vim-buffer-actions.js';
 import { LRU_BUFFER_PERF_CACHE_LIMIT } from '../../constants.js';
 import { openFileInEditor } from '../../utils/editorUtils.js';
-import { useKeyMatchers } from '../../hooks/useKeyMatchers.js';
 
 export const LARGE_PASTE_LINE_THRESHOLD = 5;
 export const LARGE_PASTE_CHAR_THRESHOLD = 500;
@@ -38,17 +148,6 @@ export const LARGE_PASTE_CHAR_THRESHOLD = 500;
 // Regex to match paste placeholders like [Pasted Text: 6 lines] or [Pasted Text: 501 chars #2]
 export const PASTED_TEXT_PLACEHOLDER_REGEX =
   /\[Pasted Text: \d+ (?:lines|chars)(?: #\d+)?\]/g;
-
-// Replace paste placeholder strings with their actual pasted content.
-export function expandPastePlaceholders(
-  text: string,
-  pastedContent: Record<string, string>,
-): string {
-  return text.replace(
-    PASTED_TEXT_PLACEHOLDER_REGEX,
-    (match) => pastedContent[match] || match,
-  );
-}
 
 export type Direction =
   | 'left'
@@ -411,13 +510,13 @@ function findNextWordBoundary(line: string, cursorCol: number): number {
 
 // Find next word across lines
 export const findNextWordAcrossLines = (
-  lines: string[],
+  store: string[],
   cursorRow: number,
   cursorCol: number,
   searchForWordStart: boolean,
 ): { row: number; col: number } | null => {
   // First try current line
-  const currentLine = lines[cursorRow] || '';
+  const currentLine = store[cursorRow] || '';
   const colInCurrentLine = searchForWordStart
     ? findNextWordStartInLine(currentLine, cursorCol)
     : findWordEndInLine(currentLine, cursorCol);
@@ -429,11 +528,11 @@ export const findNextWordAcrossLines = (
   let firstEmptyRow: number | null = null;
 
   // Search subsequent lines
-  for (let row = cursorRow + 1; row < lines.length; row++) {
-    const line = lines[row] || '';
+  for (let row = cursorRow + 1; row < store.length; row++) {
+    const line = store[row] || '';
     const chars = toCodePoints(line);
 
-    // For empty lines, if we haven't found any words yet, remember the first empty line
+    // For empty store, if we haven't found any words yet, remember the first empty line
     if (chars.length === 0) {
       if (firstEmptyRow === null) {
         firstEmptyRow = row;
@@ -463,7 +562,7 @@ export const findNextWordAcrossLines = (
     }
   }
 
-  // If no words in later lines, return the first empty line we found
+  // If no words in later store, return the first empty line we found
   if (firstEmptyRow !== null) {
     return { row: firstEmptyRow, col: 0 };
   }
@@ -473,12 +572,12 @@ export const findNextWordAcrossLines = (
 
 // Find previous word across lines
 export const findPrevWordAcrossLines = (
-  lines: string[],
+  store: string[],
   cursorRow: number,
   cursorCol: number,
 ): { row: number; col: number } | null => {
   // First try current line
-  const currentLine = lines[cursorRow] || '';
+  const currentLine = store[cursorRow] || '';
   const colInCurrentLine = findPrevWordStartInLine(currentLine, cursorCol);
 
   if (colInCurrentLine !== null) {
@@ -487,7 +586,7 @@ export const findPrevWordAcrossLines = (
 
   // Search previous lines
   for (let row = cursorRow - 1; row >= 0; row--) {
-    const line = lines[row] || '';
+    const line = store[row] || '';
     const chars = toCodePoints(line);
 
     if (chars.length === 0) continue;
@@ -512,13 +611,13 @@ export const findPrevWordAcrossLines = (
 
 // Find next big word across lines
 export const findNextBigWordAcrossLines = (
-  lines: string[],
+  store: string[],
   cursorRow: number,
   cursorCol: number,
   searchForWordStart: boolean,
 ): { row: number; col: number } | null => {
   // First try current line
-  const currentLine = lines[cursorRow] || '';
+  const currentLine = store[cursorRow] || '';
   const colInCurrentLine = searchForWordStart
     ? findNextBigWordStartInLine(currentLine, cursorCol)
     : findBigWordEndInLine(currentLine, cursorCol);
@@ -530,11 +629,11 @@ export const findNextBigWordAcrossLines = (
   let firstEmptyRow: number | null = null;
 
   // Search subsequent lines
-  for (let row = cursorRow + 1; row < lines.length; row++) {
-    const line = lines[row] || '';
+  for (let row = cursorRow + 1; row < store.length; row++) {
+    const line = store[row] || '';
     const chars = toCodePoints(line);
 
-    // For empty lines, if we haven't found any words yet, remember the first empty line
+    // For empty store, if we haven't found any words yet, remember the first empty line
     if (chars.length === 0) {
       if (firstEmptyRow === null) {
         firstEmptyRow = row;
@@ -564,7 +663,7 @@ export const findNextBigWordAcrossLines = (
     }
   }
 
-  // If no words in later lines, return the first empty line we found
+  // If no words in later store, return the first empty line we found
   if (firstEmptyRow !== null) {
     return { row: firstEmptyRow, col: 0 };
   }
@@ -574,12 +673,12 @@ export const findNextBigWordAcrossLines = (
 
 // Find previous big word across lines
 export const findPrevBigWordAcrossLines = (
-  lines: string[],
+  store: string[],
   cursorRow: number,
   cursorCol: number,
 ): { row: number; col: number } | null => {
   // First try current line
-  const currentLine = lines[cursorRow] || '';
+  const currentLine = store[cursorRow] || '';
   const colInCurrentLine = findPrevBigWordStartInLine(currentLine, cursorCol);
 
   if (colInCurrentLine !== null) {
@@ -588,7 +687,7 @@ export const findPrevBigWordAcrossLines = (
 
   // Search previous lines
   for (let row = cursorRow - 1; row >= 0; row--) {
-    const line = lines[row] || '';
+    const line = store[row] || '';
     const chars = toCodePoints(line);
 
     if (chars.length === 0) continue;
@@ -614,7 +713,7 @@ export const findPrevBigWordAcrossLines = (
 export const getPositionFromOffsets = (
   startOffset: number,
   endOffset: number,
-  lines: string[],
+  store: string[],
 ) => {
   let offset = 0;
   let startRow = 0;
@@ -623,8 +722,8 @@ export const getPositionFromOffsets = (
   let endCol = 0;
 
   // Find start position
-  for (let i = 0; i < lines.length; i++) {
-    const lineLength = lines[i].length + 1; // +1 for newline
+  for (let i = 0; i < store.length; i++) {
+    const lineLength = store[i].length + 1; // +1 for newline
     if (offset + lineLength > startOffset) {
       startRow = i;
       startCol = startOffset - offset;
@@ -635,8 +734,8 @@ export const getPositionFromOffsets = (
 
   // Find end position
   offset = 0;
-  for (let i = 0; i < lines.length; i++) {
-    const lineLength = lines[i].length + (i < lines.length - 1 ? 1 : 0); // +1 for newline except last line
+  for (let i = 0; i < store.length; i++) {
+    const lineLength = store[i].length + (i < store.length - 1 ? 1 : 0); // +1 for newline except last line
     if (offset + lineLength >= endOffset) {
       endRow = i;
       endCol = endOffset - offset;
@@ -651,22 +750,22 @@ export const getPositionFromOffsets = (
 export const getLineRangeOffsets = (
   startRow: number,
   lineCount: number,
-  lines: string[],
+  store: string[],
 ) => {
   let startOffset = 0;
 
   // Calculate start offset
   for (let i = 0; i < startRow; i++) {
-    startOffset += lines[i].length + 1; // +1 for newline
+    startOffset += store[i].length + 1; // +1 for newline
   }
 
   // Calculate end offset
   let endOffset = startOffset;
   for (let i = 0; i < lineCount; i++) {
     const lineIndex = startRow + i;
-    if (lineIndex < lines.length) {
-      endOffset += lines[lineIndex].length;
-      if (lineIndex < lines.length - 1) {
+    if (lineIndex < store.length) {
+      endOffset += store[lineIndex].length;
+      if (lineIndex < store.length - 1) {
         endOffset += 1; // +1 for newline
       }
     }
@@ -683,7 +782,7 @@ export const replaceRangeInternal = (
   endCol: number,
   text: string,
 ): TextBufferState => {
-  const currentLine = (row: number) => state.lines[row] || '';
+  const currentLine = (row: number) => state.store[row] || '';
   const currentLineLen = (row: number) => cpLen(currentLine(row));
   const clamp = (value: number, min: number, max: number) =>
     Math.min(Math.max(value, min), max);
@@ -693,13 +792,13 @@ export const replaceRangeInternal = (
     (startRow === endRow && startCol > endCol) ||
     startRow < 0 ||
     startCol < 0 ||
-    endRow >= state.lines.length ||
-    (endRow < state.lines.length && endCol > currentLineLen(endRow))
+    endRow >= state.store.length ||
+    (endRow < state.store.length && endCol > currentLineLen(endRow))
   ) {
     return state; // Invalid range
   }
 
-  const newLines = [...state.lines];
+  const newLines = state.store.split('\n');
 
   const sCol = clamp(startCol, 0, currentLineLen(startRow));
   const eCol = clamp(endCol, 0, currentLineLen(endRow));
@@ -738,7 +837,7 @@ export const replaceRangeInternal = (
 
   return {
     ...state,
-    lines: newLines,
+    store: createTextStore(newLines),
     cursorRow: Math.min(Math.max(finalCursorRow, 0), newLines.length - 1),
     cursorCol: Math.max(
       0,
@@ -774,7 +873,7 @@ interface UseTextBufferProps {
 }
 
 interface UndoHistoryEntry {
-  lines: string[];
+  store: TextStore;
   cursorRow: number;
   cursorCol: number;
   pastedContent: Record<string, string>;
@@ -818,11 +917,11 @@ export function offsetToLogicalPos(
 
   if (offset === 0) return [0, 0];
 
-  const lines = text.split('\n');
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
+  const store = text.split('\n');
+  for (let i = 0; i < store.length; i++) {
+    const line = store[i];
     const lineLength = cpLen(line);
-    const lineLengthWithNewline = lineLength + (i < lines.length - 1 ? 1 : 0);
+    const lineLengthWithNewline = lineLength + (i < store.length - 1 ? 1 : 0);
 
     if (offset <= currentOffset + lineLength) {
       // Check against lineLength first
@@ -836,7 +935,7 @@ export function offsetToLogicalPos(
       // If the offset IS the newline, and it's not the last line, advance to next line, col 0
       if (
         offset === currentOffset + lineLengthWithNewline &&
-        i < lines.length - 1
+        i < store.length - 1
       ) {
         return [i + 1, 0];
       }
@@ -847,9 +946,9 @@ export function offsetToLogicalPos(
 
   // If offset is beyond the text length, place cursor at the end of the last line
   // or [0,0] if text is empty
-  if (lines.length > 0) {
-    row = lines.length - 1;
-    col = cpLen(lines[row]);
+  if (store.length > 0) {
+    row = store.length - 1;
+    col = cpLen(store[row]);
   } else {
     row = 0;
     col = 0;
@@ -862,23 +961,23 @@ export function offsetToLogicalPos(
  * Inverse operation of offsetToLogicalPos
  */
 export function logicalPosToOffset(
-  lines: string[],
+  store: string[],
   row: number,
   col: number,
 ): number {
   let offset = 0;
 
   // Clamp row to valid range
-  const actualRow = Math.min(row, lines.length - 1);
+  const actualRow = Math.min(row, store.length - 1);
 
   // Add lengths of all lines before the target row
   for (let i = 0; i < actualRow; i++) {
-    offset += cpLen(lines[i]) + 1; // +1 for newline
+    offset += cpLen(store[i]) + 1; // +1 for newline
   }
 
   // Add column offset within the target row
-  if (actualRow >= 0 && actualRow < lines.length) {
-    offset += Math.min(col, cpLen(lines[actualRow]));
+  if (actualRow >= 0 && actualRow < store.length) {
+    offset += Math.min(col, cpLen(store[actualRow]));
   }
 
   return offset;
@@ -987,8 +1086,8 @@ export function calculateTransformationsForLine(
   return transformations;
 }
 
-export function calculateTransformations(lines: string[]): Transformation[][] {
-  return lines.map((ln) => calculateTransformationsForLine(ln));
+export function calculateTransformations(store: string[]): Transformation[][] {
+  return store.map((ln) => calculateTransformationsForLine(ln));
 }
 
 export function getTransformUnderCursor(
@@ -1554,7 +1653,7 @@ function calculateVisualCursorFromLayout(
 // --- Start of reducer logic ---
 
 export interface TextBufferState {
-  lines: string[];
+  store: TextStore;
   cursorRow: number;
   cursorCol: number;
   transformationsByLine: Transformation[][];
@@ -1568,14 +1667,13 @@ export interface TextBufferState {
   visualLayout: VisualLayout;
   pastedContent: Record<string, string>;
   expandedPaste: ExpandedPasteInfo | null;
-  yankRegister: { text: string; linewise: boolean } | null;
 }
 
 const historyLimit = 100;
 
 export const pushUndo = (currentState: TextBufferState): TextBufferState => {
   const snapshot: UndoHistoryEntry = {
-    lines: [...currentState.lines],
+    store: currentState.store.clone(),
     cursorRow: currentState.cursorRow,
     cursorCol: currentState.cursorCol,
     pastedContent: { ...currentState.pastedContent },
@@ -1704,33 +1802,6 @@ export type TextBufferAction =
   | { type: 'vim_change_to_first_nonwhitespace' }
   | { type: 'vim_delete_to_first_line'; payload: { count: number } }
   | { type: 'vim_delete_to_last_line'; payload: { count: number } }
-  | { type: 'vim_delete_char_before'; payload: { count: number } }
-  | { type: 'vim_toggle_case'; payload: { count: number } }
-  | { type: 'vim_replace_char'; payload: { char: string; count: number } }
-  | {
-      type: 'vim_find_char_forward';
-      payload: { char: string; count: number; till: boolean };
-    }
-  | {
-      type: 'vim_find_char_backward';
-      payload: { char: string; count: number; till: boolean };
-    }
-  | {
-      type: 'vim_delete_to_char_forward';
-      payload: { char: string; count: number; till: boolean };
-    }
-  | {
-      type: 'vim_delete_to_char_backward';
-      payload: { char: string; count: number; till: boolean };
-    }
-  | { type: 'vim_yank_line'; payload: { count: number } }
-  | { type: 'vim_yank_word_forward'; payload: { count: number } }
-  | { type: 'vim_yank_big_word_forward'; payload: { count: number } }
-  | { type: 'vim_yank_word_end'; payload: { count: number } }
-  | { type: 'vim_yank_big_word_end'; payload: { count: number } }
-  | { type: 'vim_yank_to_end_of_line'; payload: { count: number } }
-  | { type: 'vim_paste_after'; payload: { count: number } }
-  | { type: 'vim_paste_before'; payload: { count: number } }
   | {
       type: 'toggle_paste_expansion';
       payload: { id: string; row: number; col: number };
@@ -1748,7 +1819,7 @@ function textBufferReducerLogic(
 ): TextBufferState {
   const pushUndoLocal = pushUndo;
 
-  const currentLine = (r: number): string => state.lines[r] ?? '';
+  const currentLine = (r: number): string => state.store[r] ?? '';
   const currentLineLen = (r: number): number => cpLen(currentLine(r));
 
   switch (action.type) {
@@ -1757,10 +1828,7 @@ function textBufferReducerLogic(
       if (action.pushToUndo !== false) {
         nextState = pushUndoLocal(state);
       }
-      const newContentLines = action.payload
-        .replace(/\r\n?/g, '\n')
-        .split('\n');
-      const lines = newContentLines.length === 0 ? [''] : newContentLines;
+      const store = createTextStore(action.payload);
 
       let newCursorRow: number;
       let newCursorCol: number;
@@ -1775,13 +1843,13 @@ function textBufferReducerLogic(
         newCursorCol = 0;
       } else {
         // Default to 'end'
-        newCursorRow = lines.length - 1;
-        newCursorCol = cpLen(lines[newCursorRow] ?? '');
+        newCursorRow = store.length - 1;
+        newCursorCol = cpLen(store[newCursorRow] ?? '');
       }
 
       return {
         ...nextState,
-        lines,
+        store,
         cursorRow: newCursorRow,
         cursorCol: newCursorCol,
         preferredCol: null,
@@ -1791,7 +1859,7 @@ function textBufferReducerLogic(
 
     case 'insert': {
       const nextState = detachExpandedPaste(pushUndoLocal(state));
-      const newLines = [...nextState.lines];
+      const newLines = nextState.store.split('\n');
       let newCursorRow = nextState.cursorRow;
       let newCursorCol = nextState.cursorCol;
 
@@ -1867,7 +1935,7 @@ function textBufferReducerLogic(
 
       return {
         ...nextState,
-        lines: newLines,
+        store: createTextStore(newLines),
         cursorRow: newCursorRow,
         cursorCol: newCursorCol,
         preferredCol: null,
@@ -1890,7 +1958,7 @@ function textBufferReducerLogic(
     case 'backspace': {
       const stateWithUndo = pushUndoLocal(state);
       const currentState = detachExpandedPaste(stateWithUndo);
-      const { cursorRow, cursorCol, lines, transformationsByLine } =
+      const { cursorRow, cursorCol, store, transformationsByLine } =
         currentState;
 
       // Early return if at start of buffer
@@ -1899,14 +1967,14 @@ function textBufferReducerLogic(
       // Check if cursor is at end of an atomic placeholder
       const transformations = transformationsByLine[cursorRow] ?? [];
       const placeholder = findAtomicPlaceholderForBackspace(
-        lines[cursorRow],
+        store[cursorRow] ?? '',
         cursorCol,
         transformations,
       );
 
       if (placeholder) {
         const nextState = currentState;
-        const newLines = [...nextState.lines];
+        const newLines = nextState.store.split('\n');
         newLines[cursorRow] =
           cpSlice(newLines[cursorRow], 0, placeholder.start) +
           cpSlice(newLines[cursorRow], placeholder.end);
@@ -1926,7 +1994,7 @@ function textBufferReducerLogic(
 
         return {
           ...nextState,
-          lines: newLines,
+          store: createTextStore(newLines),
           cursorCol: placeholder.start,
           preferredCol: null,
           transformationsByLine: newTransformations,
@@ -1936,7 +2004,7 @@ function textBufferReducerLogic(
 
       // Standard backspace logic
       const nextState = currentState;
-      const newLines = [...nextState.lines];
+      const newLines = nextState.store.split('\n');
       let newCursorRow = nextState.cursorRow;
       let newCursorCol = nextState.cursorCol;
 
@@ -1974,7 +2042,7 @@ function textBufferReducerLogic(
 
       return {
         ...nextState,
-        lines: newLines,
+        store: createTextStore(newLines),
         cursorRow: newCursorRow,
         cursorCol: newCursorCol,
         preferredCol: null,
@@ -1997,7 +2065,7 @@ function textBufferReducerLogic(
 
     case 'move': {
       const { dir } = action.payload;
-      const { cursorRow, cursorCol, lines, visualLayout, preferredCol } = state;
+      const { cursorRow, cursorCol, store, visualLayout, preferredCol } = state;
 
       // Visual movements
       if (
@@ -2095,7 +2163,7 @@ function textBufferReducerLogic(
           );
           const newLogicalCol =
             transformedToLogicalMap[clampedTransformedCol] ??
-            cpLen(lines[logRow] ?? '');
+            cpLen(store[logRow] ?? '');
           return {
             ...state,
             cursorRow: logRow,
@@ -2116,9 +2184,9 @@ function textBufferReducerLogic(
 
           if (cursorCol === 0) {
             newCursorRow--;
-            newCursorCol = cpLen(lines[newCursorRow] ?? '');
+            newCursorCol = cpLen(store[newCursorRow] ?? '');
           } else {
-            const lineContent = lines[cursorRow];
+            const lineContent = store[cursorRow] ?? '';
             newCursorCol = findPrevWordBoundary(lineContent, cursorCol);
           }
           return {
@@ -2129,9 +2197,9 @@ function textBufferReducerLogic(
           };
         }
         case 'wordRight': {
-          const lineContent = lines[cursorRow] ?? '';
+          const lineContent = store[cursorRow] ?? '';
           if (
-            cursorRow === lines.length - 1 &&
+            cursorRow === store.length - 1 &&
             cursorCol === cpLen(lineContent)
           ) {
             return state;
@@ -2169,20 +2237,20 @@ function textBufferReducerLogic(
     case 'delete': {
       const stateWithUndo = pushUndoLocal(state);
       const currentState = detachExpandedPaste(stateWithUndo);
-      const { cursorRow, cursorCol, lines, transformationsByLine } =
+      const { cursorRow, cursorCol, store, transformationsByLine } =
         currentState;
 
       // Check if cursor is at start of an atomic placeholder
       const transformations = transformationsByLine[cursorRow] ?? [];
       const placeholder = findAtomicPlaceholderForDelete(
-        lines[cursorRow],
+        store[cursorRow] ?? '',
         cursorCol,
         transformations,
       );
 
       if (placeholder) {
         const nextState = currentState;
-        const newLines = [...nextState.lines];
+        const newLines = nextState.store.split('\n');
         newLines[cursorRow] =
           cpSlice(newLines[cursorRow], 0, placeholder.start) +
           cpSlice(newLines[cursorRow], placeholder.end);
@@ -2202,7 +2270,7 @@ function textBufferReducerLogic(
 
         return {
           ...nextState,
-          lines: newLines,
+          store: createTextStore(newLines),
           // cursorCol stays the same
           preferredCol: null,
           transformationsByLine: newTransformations,
@@ -2214,13 +2282,13 @@ function textBufferReducerLogic(
       const lineContent = currentLine(cursorRow);
       let lineDelta = 0;
       const nextState = currentState;
-      const newLines = [...nextState.lines];
+      const newLines = nextState.store.split('\n');
 
       if (cursorCol < currentLineLen(cursorRow)) {
         newLines[cursorRow] =
           cpSlice(lineContent, 0, cursorCol) +
           cpSlice(lineContent, cursorCol + 1);
-      } else if (cursorRow < lines.length - 1) {
+      } else if (cursorRow < store.length - 1) {
         const nextLineContent = currentLine(cursorRow + 1);
         newLines[cursorRow] = lineContent + nextLineContent;
         newLines.splice(cursorRow + 1, 1);
@@ -2243,7 +2311,7 @@ function textBufferReducerLogic(
 
       return {
         ...nextState,
-        lines: newLines,
+        store: createTextStore(newLines),
         preferredCol: null,
         pastedContent: newPastedContent,
         expandedPaste: newExpandedPaste,
@@ -2257,7 +2325,7 @@ function textBufferReducerLogic(
       if (cursorCol === 0 && cursorRow === 0) return currentState;
 
       const nextState = currentState;
-      const newLines = [...nextState.lines];
+      const newLines = nextState.store.split('\n');
       let newCursorRow = cursorRow;
       let newCursorCol = cursorCol;
 
@@ -2284,7 +2352,7 @@ function textBufferReducerLogic(
 
       return {
         ...nextState,
-        lines: newLines,
+        store: createTextStore(newLines),
         cursorRow: newCursorRow,
         cursorCol: newCursorCol,
         preferredCol: null,
@@ -2294,16 +2362,16 @@ function textBufferReducerLogic(
     case 'delete_word_right': {
       const stateWithUndo = pushUndoLocal(state);
       const currentState = detachExpandedPaste(stateWithUndo);
-      const { cursorRow, cursorCol, lines } = currentState;
+      const { cursorRow, cursorCol, store } = currentState;
       const lineContent = currentLine(cursorRow);
       const lineLen = cpLen(lineContent);
 
-      if (cursorCol >= lineLen && cursorRow === lines.length - 1) {
+      if (cursorCol >= lineLen && cursorRow === store.length - 1) {
         return currentState;
       }
 
       const nextState = currentState;
-      const newLines = [...nextState.lines];
+      const newLines = nextState.store.split('\n');
 
       if (cursorCol >= lineLen) {
         // Act as a delete, joining with the next line
@@ -2319,7 +2387,7 @@ function textBufferReducerLogic(
 
       return {
         ...nextState,
-        lines: newLines,
+        store: createTextStore(newLines),
         preferredCol: null,
       };
     }
@@ -2327,26 +2395,26 @@ function textBufferReducerLogic(
     case 'kill_line_right': {
       const stateWithUndo = pushUndoLocal(state);
       const currentState = detachExpandedPaste(stateWithUndo);
-      const { cursorRow, cursorCol, lines } = currentState;
+      const { cursorRow, cursorCol, store } = currentState;
       const lineContent = currentLine(cursorRow);
       if (cursorCol < currentLineLen(cursorRow)) {
         const nextState = currentState;
-        const newLines = [...nextState.lines];
+        const newLines = nextState.store.split('\n');
         newLines[cursorRow] = cpSlice(lineContent, 0, cursorCol);
         return {
           ...nextState,
-          lines: newLines,
+          store: createTextStore(newLines),
         };
-      } else if (cursorRow < lines.length - 1) {
+      } else if (cursorRow < store.length - 1) {
         // Act as a delete
         const nextState = currentState;
         const nextLineContent = currentLine(cursorRow + 1);
-        const newLines = [...nextState.lines];
+        const newLines = nextState.store.split('\n');
         newLines[cursorRow] = lineContent + nextLineContent;
         newLines.splice(cursorRow + 1, 1);
         return {
           ...nextState,
-          lines: newLines,
+          store: createTextStore(newLines),
           preferredCol: null,
         };
       }
@@ -2360,11 +2428,11 @@ function textBufferReducerLogic(
       if (cursorCol > 0) {
         const nextState = currentState;
         const lineContent = currentLine(cursorRow);
-        const newLines = [...nextState.lines];
+        const newLines = nextState.store.split('\n');
         newLines[cursorRow] = cpSlice(lineContent, cursorCol);
         return {
           ...nextState,
-          lines: newLines,
+          store: createTextStore(newLines),
           cursorCol: 0,
           preferredCol: null,
         };
@@ -2377,7 +2445,7 @@ function textBufferReducerLogic(
       if (!stateToRestore) return state;
 
       const currentSnapshot: UndoHistoryEntry = {
-        lines: [...state.lines],
+        store: state.store.clone(),
         cursorRow: state.cursorRow,
         cursorCol: state.cursorCol,
         pastedContent: { ...state.pastedContent },
@@ -2396,7 +2464,7 @@ function textBufferReducerLogic(
       if (!stateToRestore) return state;
 
       const currentSnapshot: UndoHistoryEntry = {
-        lines: [...state.lines],
+        store: state.store.clone(),
         cursorRow: state.cursorRow,
         cursorCol: state.cursorCol,
         pastedContent: { ...state.pastedContent },
@@ -2424,7 +2492,7 @@ function textBufferReducerLogic(
 
       const oldLineCount = endRow - startRow + 1;
       const newLineCount =
-        newState.lines.length - (nextState.lines.length - oldLineCount);
+        newState.store.length - (nextState.store.length - oldLineCount);
       const lineDelta = newLineCount - oldLineCount;
 
       const { newInfo: newExpandedPaste, isDetached } = shiftExpandedRegions(
@@ -2449,7 +2517,7 @@ function textBufferReducerLogic(
     case 'move_to_offset': {
       const { offset } = action.payload;
       const [newRow, newCol] = offsetToLogicalPos(
-        state.lines.join('\n'),
+        state.store.getText(),
         offset,
       );
       return {
@@ -2512,21 +2580,6 @@ function textBufferReducerLogic(
     case 'vim_change_to_first_nonwhitespace':
     case 'vim_delete_to_first_line':
     case 'vim_delete_to_last_line':
-    case 'vim_delete_char_before':
-    case 'vim_toggle_case':
-    case 'vim_replace_char':
-    case 'vim_find_char_forward':
-    case 'vim_find_char_backward':
-    case 'vim_delete_to_char_forward':
-    case 'vim_delete_to_char_backward':
-    case 'vim_yank_line':
-    case 'vim_yank_word_forward':
-    case 'vim_yank_big_word_forward':
-    case 'vim_yank_word_end':
-    case 'vim_yank_big_word_end':
-    case 'vim_yank_to_end_of_line':
-    case 'vim_paste_after':
-    case 'vim_paste_before':
       return handleVimAction(state, action as VimAction);
 
     case 'toggle_paste_expansion': {
@@ -2536,7 +2589,7 @@ function textBufferReducerLogic(
       if (expandedPaste && expandedPaste.id === id) {
         const nextState = pushUndoLocal(state);
         // COLLAPSE: Restore original line with placeholder
-        const newLines = [...nextState.lines];
+        const newLines = nextState.store.split('\n');
         newLines.splice(
           expandedPaste.startLine,
           expandedPaste.lineCount,
@@ -2549,7 +2602,7 @@ function textBufferReducerLogic(
 
         return {
           ...nextState,
-          lines: newLines,
+          store: createTextStore(newLines),
           cursorRow: newCursorRow,
           cursorCol: newCursorCol,
           preferredCol: null,
@@ -2580,7 +2633,7 @@ function textBufferReducerLogic(
           });
           // Update transformations because they are needed for finding the next placeholder
           currentState.transformationsByLine = calculateTransformations(
-            currentState.lines,
+            currentState.store.split('\n'),
           );
         }
 
@@ -2619,12 +2672,12 @@ function textBufferReducerLogic(
         };
 
         // Try provided row first for precise targeting
-        if (targetRow >= 0 && targetRow < currentState.lines.length) {
+        if (targetRow >= 0 && targetRow < currentState.store.length) {
           tryFindOnLine(targetRow);
         }
 
         if (lineIndex === -1) {
-          for (let i = 0; i < currentState.lines.length; i++) {
+          for (let i = 0; i < currentState.store.length; i++) {
             if (tryFindOnLine(i)) break;
           }
         }
@@ -2633,13 +2686,13 @@ function textBufferReducerLogic(
 
         const nextState = pushUndoLocal(currentState);
 
-        const line = nextState.lines[lineIndex];
+        const line = nextState.store[lineIndex] ?? '';
         const prefix = cpSlice(line, 0, placeholderStart);
         const suffix = cpSlice(line, placeholderStart + cpLen(id));
 
         // Split content into lines
         const contentLines = content.split('\n');
-        const newLines = [...nextState.lines];
+        const newLines = nextState.store.split('\n');
 
         let expandedLines: string[];
         if (contentLines.length === 1) {
@@ -2663,7 +2716,7 @@ function textBufferReducerLogic(
 
         return {
           ...nextState,
-          lines: newLines,
+          store: createTextStore(newLines),
           cursorRow: newCursorRow,
           cursorCol: newCursorCol,
           preferredCol: null,
@@ -2694,8 +2747,8 @@ export function textBufferReducer(
   const newState = textBufferReducerLogic(state, action, options);
 
   const newTransformedLines =
-    newState.lines !== state.lines
-      ? calculateTransformations(newState.lines)
+    newState.store !== state.store
+      ? calculateTransformations(newState.store.split('\n'))
       : state.transformationsByLine;
 
   const oldTransform = getTransformUnderCursor(
@@ -2715,7 +2768,7 @@ export function textBufferReducer(
     (oldTransform !== null || newTransform !== null);
 
   if (
-    newState.lines !== state.lines ||
+    newState.store !== state.store ||
     newState.viewportWidth !== state.viewportWidth ||
     oldInside !== newInside ||
     movedBetweenTransforms
@@ -2726,10 +2779,11 @@ export function textBufferReducer(
     return {
       ...newState,
       preferredCol: shouldResetPreferred ? null : newState.preferredCol,
-      visualLayout: calculateLayout(newState.lines, newState.viewportWidth, [
-        newState.cursorRow,
-        newState.cursorCol,
-      ]),
+      visualLayout: calculateLayout(
+        newState.store.split('\n'),
+        newState.viewportWidth,
+        [newState.cursorRow, newState.cursorCol],
+      ),
       transformationsByLine: newTransformedLines,
     };
   }
@@ -2752,23 +2806,23 @@ export function useTextBuffer({
   singleLine = false,
   getPreferredEditor,
 }: UseTextBufferProps): TextBuffer {
-  const keyMatchers = useKeyMatchers();
+  const settings = useSettings();
+  const useNative = (settings as any).experimental?.useNativeBuffer ?? false;
+
   const initialState = useMemo((): TextBufferState => {
-    const lines = initialText.split('\n');
+    const store = createTextStore(initialText, useNative);
+    const storeLines = store.split('\n');
     const [initialCursorRow, initialCursorCol] = calculateInitialCursorPosition(
-      lines.length === 0 ? [''] : lines,
+      storeLines,
       initialCursorOffset,
     );
-    const transformationsByLine = calculateTransformations(
-      lines.length === 0 ? [''] : lines,
-    );
-    const visualLayout = calculateLayout(
-      lines.length === 0 ? [''] : lines,
-      viewport.width,
-      [initialCursorRow, initialCursorCol],
-    );
+    const transformationsByLine = calculateTransformations(storeLines);
+    const visualLayout = calculateLayout(storeLines, viewport.width, [
+      initialCursorRow,
+      initialCursorCol,
+    ]);
     return {
-      lines: lines.length === 0 ? [''] : lines,
+      store,
       cursorRow: initialCursorRow,
       cursorCol: initialCursorCol,
       transformationsByLine,
@@ -2782,7 +2836,6 @@ export function useTextBuffer({
       visualLayout,
       pastedContent: {},
       expandedPaste: null,
-      yankRegister: null,
     };
   }, [initialText, initialCursorOffset, viewport.width, viewport.height]);
 
@@ -2792,7 +2845,7 @@ export function useTextBuffer({
     initialState,
   );
   const {
-    lines,
+    store,
     cursorRow,
     cursorCol,
     preferredCol,
@@ -2803,7 +2856,7 @@ export function useTextBuffer({
     expandedPaste,
   } = state;
 
-  const text = useMemo(() => lines.join('\n'), [lines]);
+  const text = useMemo(() => store.getText(), [store]);
 
   const visualCursor = useMemo(
     () => calculateVisualCursorFromLayout(visualLayout, [cursorRow, cursorCol]),
@@ -2819,11 +2872,16 @@ export function useTextBuffer({
 
   const [scrollRowState, setScrollRowState] = useState<number>(0);
 
+  const onChangeRef = useRef(onChange);
+  onChangeRef.current = onChange;
+  const lastCalledText = useMemo(() => ({ current: initialText }), []);
+
   useEffect(() => {
-    if (onChange) {
-      onChange(text);
+    if (onChangeRef.current && text !== lastCalledText.current) {
+      lastCalledText.current = text;
+      onChangeRef.current(text);
     }
-  }, [text, onChange]);
+  }, [text, lastCalledText]);
 
   useEffect(() => {
     dispatch({
@@ -3087,58 +3145,6 @@ export function useTextBuffer({
     dispatch({ type: 'vim_delete_char', payload: { count } });
   }, []);
 
-  const vimDeleteCharBefore = useCallback((count: number): void => {
-    dispatch({ type: 'vim_delete_char_before', payload: { count } });
-  }, []);
-
-  const vimToggleCase = useCallback((count: number): void => {
-    dispatch({ type: 'vim_toggle_case', payload: { count } });
-  }, []);
-
-  const vimReplaceChar = useCallback((char: string, count: number): void => {
-    dispatch({ type: 'vim_replace_char', payload: { char, count } });
-  }, []);
-
-  const vimFindCharForward = useCallback(
-    (char: string, count: number, till: boolean): void => {
-      dispatch({
-        type: 'vim_find_char_forward',
-        payload: { char, count, till },
-      });
-    },
-    [],
-  );
-
-  const vimFindCharBackward = useCallback(
-    (char: string, count: number, till: boolean): void => {
-      dispatch({
-        type: 'vim_find_char_backward',
-        payload: { char, count, till },
-      });
-    },
-    [],
-  );
-
-  const vimDeleteToCharForward = useCallback(
-    (char: string, count: number, till: boolean): void => {
-      dispatch({
-        type: 'vim_delete_to_char_forward',
-        payload: { char, count, till },
-      });
-    },
-    [],
-  );
-
-  const vimDeleteToCharBackward = useCallback(
-    (char: string, count: number, till: boolean): void => {
-      dispatch({
-        type: 'vim_delete_to_char_backward',
-        payload: { char, count, till },
-      });
-    },
-    [],
-  );
-
   const vimInsertAtCursor = useCallback((): void => {
     dispatch({ type: 'vim_insert_at_cursor' });
   }, []);
@@ -3191,43 +3197,14 @@ export function useTextBuffer({
     dispatch({ type: 'vim_escape_insert_mode' });
   }, []);
 
-  const vimYankLine = useCallback((count: number): void => {
-    dispatch({ type: 'vim_yank_line', payload: { count } });
-  }, []);
-
-  const vimYankWordForward = useCallback((count: number): void => {
-    dispatch({ type: 'vim_yank_word_forward', payload: { count } });
-  }, []);
-
-  const vimYankBigWordForward = useCallback((count: number): void => {
-    dispatch({ type: 'vim_yank_big_word_forward', payload: { count } });
-  }, []);
-
-  const vimYankWordEnd = useCallback((count: number): void => {
-    dispatch({ type: 'vim_yank_word_end', payload: { count } });
-  }, []);
-
-  const vimYankBigWordEnd = useCallback((count: number): void => {
-    dispatch({ type: 'vim_yank_big_word_end', payload: { count } });
-  }, []);
-
-  const vimYankToEndOfLine = useCallback((count: number): void => {
-    dispatch({ type: 'vim_yank_to_end_of_line', payload: { count } });
-  }, []);
-
-  const vimPasteAfter = useCallback((count: number): void => {
-    dispatch({ type: 'vim_paste_after', payload: { count } });
-  }, []);
-
-  const vimPasteBefore = useCallback((count: number): void => {
-    dispatch({ type: 'vim_paste_before', payload: { count } });
-  }, []);
-
   const openInExternalEditor = useCallback(async (): Promise<void> => {
     const tmpDir = fs.mkdtempSync(pathMod.join(os.tmpdir(), 'gemini-edit-'));
     const filePath = pathMod.join(tmpDir, 'buffer.txt');
     // Expand paste placeholders so user sees full content in editor
-    const expandedText = expandPastePlaceholders(text, pastedContent);
+    const expandedText = text.replace(
+      PASTED_TEXT_PLACEHOLDER_REGEX,
+      (match) => pastedContent[match] || match,
+    );
     fs.writeFileSync(filePath, expandedText, 'utf8');
 
     dispatch({ type: 'create_undo_snapshot' });
@@ -3302,10 +3279,10 @@ export function useTextBuffer({
         return true;
       }
       if (keyMatchers[Command.MOVE_RIGHT](key)) {
-        const lastLineIdx = lines.length - 1;
+        const lastLineIdx = store.length - 1;
         if (
           cursorRow === lastLineIdx &&
-          cursorCol === cpLen(lines[lastLineIdx] ?? '')
+          cursorCol === cpLen(store[lastLineIdx] ?? '')
         ) {
           return false;
         }
@@ -3358,10 +3335,10 @@ export function useTextBuffer({
         return true;
       }
       if (keyMatchers[Command.DELETE_CHAR_RIGHT](key)) {
-        const lastLineIdx = lines.length - 1;
+        const lastLineIdx = store.length - 1;
         if (
           cursorRow === lastLineIdx &&
-          cursorCol === cpLen(lines[lastLineIdx] ?? '')
+          cursorCol === cpLen(store[lastLineIdx] ?? '')
         ) {
           return false;
         }
@@ -3394,13 +3371,12 @@ export function useTextBuffer({
       redo,
       cursorRow,
       cursorCol,
-      lines,
+      store,
       singleLine,
       setText,
       text,
       visualCursor,
       visualLines,
-      keyMatchers,
     ],
   );
 
@@ -3500,7 +3476,7 @@ export function useTextBuffer({
 
         const newCursorRow = logRow;
         const newCursorCol =
-          transformedToLogicalMap[transformedCol] ?? cpLen(lines[logRow] ?? '');
+          transformedToLogicalMap[transformedCol] ?? cpLen(store[logRow] ?? '');
 
         dispatch({
           type: 'set_cursor',
@@ -3512,7 +3488,7 @@ export function useTextBuffer({
         });
       }
     },
-    [visualLayout, lines],
+    [visualLayout, store],
   );
 
   const getLogicalPositionFromVisual = useCallback(
@@ -3568,16 +3544,16 @@ export function useTextBuffer({
 
       const row = logRow;
       const col =
-        transformedToLogicalMap[transformedCol] ?? cpLen(lines[logRow] ?? '');
+        transformedToLogicalMap[transformedCol] ?? cpLen(store[logRow] ?? '');
 
       return { row, col };
     },
-    [visualLayout, lines],
+    [visualLayout, store],
   );
 
   const getOffset = useCallback(
-    (): number => logicalPosToOffset(lines, cursorRow, cursorCol),
-    [lines, cursorRow, cursorCol],
+    (): number => logicalPosToOffset(store.split('\n'), cursorRow, cursorCol),
+    [store, cursorRow, cursorCol],
   );
 
   const togglePasteExpansion = useCallback(
@@ -3595,7 +3571,7 @@ export function useTextBuffer({
 
   const returnValue: TextBuffer = useMemo(
     () => ({
-      lines,
+      store,
       text,
       cursor: [cursorRow, cursorCol],
       preferredCol,
@@ -3670,13 +3646,6 @@ export function useTextBuffer({
       vimMoveBigWordBackward,
       vimMoveBigWordEnd,
       vimDeleteChar,
-      vimDeleteCharBefore,
-      vimToggleCase,
-      vimReplaceChar,
-      vimFindCharForward,
-      vimFindCharBackward,
-      vimDeleteToCharForward,
-      vimDeleteToCharBackward,
       vimInsertAtCursor,
       vimAppendAtCursor,
       vimOpenLineBelow,
@@ -3690,17 +3659,9 @@ export function useTextBuffer({
       vimMoveToLastLine,
       vimMoveToLine,
       vimEscapeInsertMode,
-      vimYankLine,
-      vimYankWordForward,
-      vimYankBigWordForward,
-      vimYankWordEnd,
-      vimYankBigWordEnd,
-      vimYankToEndOfLine,
-      vimPasteAfter,
-      vimPasteBefore,
     }),
     [
-      lines,
+      store,
       text,
       cursorRow,
       cursorCol,
@@ -3773,13 +3734,6 @@ export function useTextBuffer({
       vimMoveBigWordBackward,
       vimMoveBigWordEnd,
       vimDeleteChar,
-      vimDeleteCharBefore,
-      vimToggleCase,
-      vimReplaceChar,
-      vimFindCharForward,
-      vimFindCharBackward,
-      vimDeleteToCharForward,
-      vimDeleteToCharBackward,
       vimInsertAtCursor,
       vimAppendAtCursor,
       vimOpenLineBelow,
@@ -3793,14 +3747,6 @@ export function useTextBuffer({
       vimMoveToLastLine,
       vimMoveToLine,
       vimEscapeInsertMode,
-      vimYankLine,
-      vimYankWordForward,
-      vimYankBigWordForward,
-      vimYankWordEnd,
-      vimYankBigWordEnd,
-      vimYankToEndOfLine,
-      vimPasteAfter,
-      vimPasteBefore,
     ],
   );
   return returnValue;
@@ -3808,7 +3754,7 @@ export function useTextBuffer({
 
 export interface TextBuffer {
   // State
-  lines: string[]; // Logical lines
+  store: TextStore; // Logical lines
   text: string;
   cursor: [number, number]; // Logical cursor [row, col]
   /**
@@ -4095,20 +4041,6 @@ export interface TextBuffer {
    * Delete N characters at cursor (vim 'x' command)
    */
   vimDeleteChar: (count: number) => void;
-  /** Delete N characters before cursor (vim 'X') */
-  vimDeleteCharBefore: (count: number) => void;
-  /** Toggle case of N characters at cursor (vim '~') */
-  vimToggleCase: (count: number) => void;
-  /** Replace N characters at cursor with char, stay in NORMAL mode (vim 'r') */
-  vimReplaceChar: (char: string, count: number) => void;
-  /** Move to Nth occurrence of char forward on line; till=true stops before it (vim 'f'/'t') */
-  vimFindCharForward: (char: string, count: number, till: boolean) => void;
-  /** Move to Nth occurrence of char backward on line; till=true stops after it (vim 'F'/'T') */
-  vimFindCharBackward: (char: string, count: number, till: boolean) => void;
-  /** Delete from cursor to Nth occurrence of char forward; till=true excludes the char (vim 'df'/'dt') */
-  vimDeleteToCharForward: (char: string, count: number, till: boolean) => void;
-  /** Delete from Nth occurrence of char backward to cursor; till=true excludes the char (vim 'dF'/'dT') */
-  vimDeleteToCharBackward: (char: string, count: number, till: boolean) => void;
   /**
    * Enter insert mode at cursor (vim 'i' command)
    */
@@ -4161,20 +4093,4 @@ export interface TextBuffer {
    * Handle escape from insert mode (moves cursor left if not at line start)
    */
   vimEscapeInsertMode: () => void;
-  /** Yank N lines into the unnamed register (vim 'yy' / 'Nyy') */
-  vimYankLine: (count: number) => void;
-  /** Yank forward N words into the unnamed register (vim 'yw') */
-  vimYankWordForward: (count: number) => void;
-  /** Yank forward N big words into the unnamed register (vim 'yW') */
-  vimYankBigWordForward: (count: number) => void;
-  /** Yank to end of N words into the unnamed register (vim 'ye') */
-  vimYankWordEnd: (count: number) => void;
-  /** Yank to end of N big words into the unnamed register (vim 'yE') */
-  vimYankBigWordEnd: (count: number) => void;
-  /** Yank from cursor to end of line into the unnamed register (vim 'y$') */
-  vimYankToEndOfLine: (count: number) => void;
-  /** Paste the unnamed register after cursor (vim 'p') */
-  vimPasteAfter: (count: number) => void;
-  /** Paste the unnamed register before cursor (vim 'P') */
-  vimPasteBefore: (count: number) => void;
 }
